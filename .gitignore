@@ -1,0 +1,12 @@
+# Datasets
+dataset/
+data/
+
+# Model Files
+*.keras
+*.task
+labels.json
+
+# Python Cache
+__pycache__/
+*.pyc
