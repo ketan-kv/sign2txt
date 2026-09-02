@@ -19,8 +19,8 @@ def main():
         
     extractor = MediaPipeExtractor()
     
-    # Define header: label, f0...f131 (132 features)
-    header = ["label"] + [f"f{i}" for i in range(132)]
+    # Define header: label, f0...f125 (126 features)
+    header = ["label"] + [f"f{i}" for i in range(126)]
     rows = []
     
     # Get all subdirectories (A-Z, 0-9), ignoring hidden OS files

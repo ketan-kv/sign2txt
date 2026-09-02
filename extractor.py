@@ -39,58 +39,55 @@ class MediaPipeExtractor:
         mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=frame_rgb)
         results = self.detector.detect(mp_image)
         
-        # 132 Features: 2 hands * (21 landmarks * 3 coords + 3 palm normal vector)
-        features = np.zeros(132, dtype=np.float32)
+        # 126 Features: Left Hand (63) + Right Hand (63)
+        features = np.zeros(126, dtype=np.float32)
         
         if not results.hand_landmarks:
             return features, results
             
-        # Sort hands by wrist X-coordinate
-        hands_data = sorted(results.hand_landmarks, key=lambda hl: hl[0].x)
-        
-        # 1. Global Normalization: Find the midpoint of all detected wrists
-        wrists = [hl[0] for hl in hands_data]
-        anchor_x = sum([w.x for w in wrists]) / len(wrists)
-        anchor_y = sum([w.y for w in wrists]) / len(wrists)
-        anchor_z = sum([w.z for w in wrists]) / len(wrists)
-        
-        # 2. Scale Invariance: Find maximum distance from anchor to any point
-        max_dist = 1e-6
-        for hl in hands_data:
-            for lm in hl:
-                dist = np.sqrt((lm.x - anchor_x)**2 + (lm.y - anchor_y)**2 + (lm.z - anchor_z)**2)
-                max_dist = max(max_dist, dist)
-                
-        for i, hl in enumerate(hands_data):
-            if i >= 2: break
+        extracted_hands = []
+        for i, hand_landmarks in enumerate(results.hand_landmarks):
+            handedness = results.handedness[i][0].category_name
+            wrist = hand_landmarks[0]
             
             hand_features = []
-            
-            # Append normalized scale-invariant coordinates (63 features)
-            for lm in hl:
+            for lm in hand_landmarks:
                 hand_features.extend([
-                    (lm.x - anchor_x) / max_dist,
-                    (lm.y - anchor_y) / max_dist,
-                    (lm.z - anchor_z) / max_dist
+                    lm.x - wrist.x,
+                    lm.y - wrist.y,
+                    lm.z - wrist.z
                 ])
                 
-            # 3. Palm Orientation: Calculate Palm Normal Vector (3 features)
-            v1_x, v1_y, v1_z = hl[5].x - hl[0].x, hl[5].y - hl[0].y, hl[5].z - hl[0].z
-            v2_x, v2_y, v2_z = hl[17].x - hl[0].x, hl[17].y - hl[0].y, hl[17].z - hl[0].z
+            extracted_hands.append({
+                "handedness": handedness,
+                "x_coord": wrist.x,
+                "features": hand_features
+            })
             
-            # Cross Product
-            nx = v1_y * v2_z - v1_z * v2_y
-            ny = v1_z * v2_x - v1_x * v2_z
-            nz = v1_x * v2_y - v1_y * v2_x
+        if len(extracted_hands) == 1:
+            # Single-Hand Fallback
+            start_idx = 0 if extracted_hands[0]["handedness"] == "Left" else 63
+            features[start_idx:start_idx+63] = extracted_hands[0]["features"]
             
-            # Normalize Vector
-            n_mag = np.sqrt(nx**2 + ny**2 + nz**2) + 1e-6
-            hand_features.extend([nx/n_mag, ny/n_mag, nz/n_mag])
+        elif len(extracted_hands) >= 2:
+            h1, h2 = extracted_hands[0], extracted_hands[1]
             
-            # Insert into feature array
-            start_idx = i * 66
-            features[start_idx:start_idx+66] = hand_features
-            
+            # Check if MediaPipe correctly labeled one Left and one Right
+            if h1["handedness"] != h2["handedness"]:
+                idx1 = 0 if h1["handedness"] == "Left" else 63
+                idx2 = 0 if h2["handedness"] == "Left" else 63
+                features[idx1:idx1+63] = h1["features"]
+                features[idx2:idx2+63] = h2["features"]
+            else:
+                # CONFLICT: MediaPipe got confused by occlusion (e.g. M, N, H)
+                # and labeled both hands as 'Left' or both as 'Right'.
+                # Fallback: The hand physically on the left side of the mirrored screen is the physical Left hand.
+                left_hand = h1 if h1["x_coord"] < h2["x_coord"] else h2
+                right_hand = h2 if h1["x_coord"] < h2["x_coord"] else h1
+                
+                features[0:63] = left_hand["features"]
+                features[63:126] = right_hand["features"]
+                
         return features, results
         
     def draw_landmarks(self, frame, results):

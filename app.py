@@ -7,25 +7,25 @@ import numpy as np
 import json
 import os
 import time
-from extractor import MediaPipeExtractor
 
 class ISLApp:
     def __init__(self, root):
         self.root = root
-        self.root.title("ISL Detection - Snapshot Mode")
+        self.root.title("ISL Detection - CNN Guide Box Mode")
         self.root.geometry("800x800")
         self.root.configure(bg="#2b2b2b")
         
-        if not os.path.exists("isl_dnn_model.keras") or not os.path.exists("labels.json"):
-            print("Error: Required model files missing. Run train.py first.")
+        if not os.path.exists("isl_cnn_model.keras") or not os.path.exists("labels.json"):
+            print("Error: Required model files missing. Run train_cnn.py first.")
             self.root.destroy()
             return
             
-        self.model = tf.keras.models.load_model("isl_dnn_model.keras")
+        self.model = tf.keras.models.load_model("isl_cnn_model.keras")
         with open("labels.json", "r") as f:
-            self.class_names = json.load(f)
+            # Re-map keys from string to int since dict keys are saved as strings in JSON
+            raw_map = json.load(f)
+            self.class_names = {int(k): v for k, v in raw_map.items()}
             
-        self.extractor = MediaPipeExtractor()
         self.cap = cv2.VideoCapture(0)
         
         # Snapshot Mode State
@@ -33,9 +33,11 @@ class ISLApp:
         self.cooldown_until = 0.0
         self.flash_frames = 0
         
-        # UI Constants
+        # UI & CNN Constants
         self.WIDTH, self.HEIGHT = 640, 480
-        # Target Box taking up ~70% of the screen center
+        self.CNN_IMG_SIZE = 224
+        
+        # Target Box taking up central portion of screen
         self.BOX_X1 = int(self.WIDTH * 0.15)
         self.BOX_Y1 = int(self.HEIGHT * 0.15)
         self.BOX_X2 = int(self.WIDTH * 0.85)
@@ -90,15 +92,23 @@ class ISLApp:
                 
     def quit_app(self):
         self.cap.release()
-        try: self.extractor.detector.close()
-        except: pass
         self.root.destroy()
         
-    def get_prediction(self, features):
-        input_data = np.expand_dims(features, axis=0)
-        predictions = self.model(input_data, training=False).numpy()
-        max_idx = np.argmax(predictions[0])
-        return self.class_names[str(max_idx)], predictions[0][max_idx]
+    def predict_crop(self, frame_crop):
+        # Resize crop to MobileNetV2 expected size
+        img = cv2.resize(frame_crop, (self.CNN_IMG_SIZE, self.CNN_IMG_SIZE))
+        # Convert BGR to RGB
+        img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+        # Normalize 0-1
+        img = img.astype('float32') / 255.0
+        # Expand dims for batch size 1
+        input_data = np.expand_dims(img, axis=0)
+        
+        predictions = self.model(input_data, training=False).numpy()[0]
+        max_idx = np.argmax(predictions)
+        conf = predictions[max_idx]
+        
+        return self.class_names[max_idx], conf
         
     def trigger_snapshot(self, pred_char):
         if pred_char.lower() == "space":
@@ -108,7 +118,6 @@ class ISLApp:
         else:
             self.text_box.insert(tk.END, pred_char)
             
-        # Trigger screen flash and cooldown
         self.flash_frames = 3
         self.cooldown_until = time.time() + 1.5
         
@@ -118,51 +127,37 @@ class ISLApp:
             frame = cv2.flip(frame, 1)
             frame = cv2.resize(frame, (self.WIDTH, self.HEIGHT))
             
-            features, results = self.extractor.extract(frame)
-            frame = self.extractor.draw_landmarks(frame, results)
+            # 1. Physical hard-crop extraction (No MediaPipe)
+            hand_crop = frame[self.BOX_Y1:self.BOX_Y2, self.BOX_X1:self.BOX_X2]
             
-            # Check if hand is inside the large target box
-            in_box = False
-            if results and results.hand_landmarks:
-                in_box = True
-                for hand_landmarks in results.hand_landmarks:
-                    wrist = hand_landmarks[0]
-                    wx, wy = int(wrist.x * self.WIDTH), int(wrist.y * self.HEIGHT)
-                    if not (self.BOX_X1 <= wx <= self.BOX_X2 and self.BOX_Y1 <= wy <= self.BOX_Y2):
-                        in_box = False
-                        break
-                        
+            # 2. CNN Prediction
+            pred_char, conf = self.predict_crop(hand_crop)
+            
             # Live Debug Info
-            display_text = "Prediction: None"
-            color = (0, 0, 255)
-            if not np.all(features == 0.0):
-                pred_char, conf = self.get_prediction(features)
-                display_text = f"Prediction: {pred_char} ({conf*100:.1f}%)"
-                color = (0, 255, 0) if conf > 0.6 else (0, 165, 255)
-                
+            display_text = f"CNN: {pred_char} ({conf*100:.1f}%)"
+            color = (0, 255, 0) if conf > 0.7 else (0, 165, 255)
             cv2.putText(frame, display_text, (20, 40), cv2.FONT_HERSHEY_SIMPLEX, 0.8, color, 2)
             
             # Draw Target Box
-            box_color = (0, 255, 0) if in_box else (255, 255, 255)
-            cv2.rectangle(frame, (self.BOX_X1, self.BOX_Y1), (self.BOX_X2, self.BOX_Y2), box_color, 2)
+            cv2.rectangle(frame, (self.BOX_X1, self.BOX_Y1), (self.BOX_X2, self.BOX_Y2), color, 2)
             
             current_time = time.time()
             
-            # Timer & Snapshot Logic
+            # Timer Logic
             if current_time < self.cooldown_until:
                 cv2.putText(frame, "Snapshot Captured! Resetting...", (self.BOX_X1 + 10, self.BOX_Y1 + 30), 
                             cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 255), 2)
                 self.snapshot_timer_start = None
             else:
-                if in_box and not np.all(features == 0.0):
+                # We assume the user has placed their hand in the box. 
+                # If confidence is > 70%, start the 2 second capture timer.
+                if conf > 0.7:
                     if self.snapshot_timer_start is None:
                         self.snapshot_timer_start = current_time
                         
                     remaining = max(0.0, 2.0 - (current_time - self.snapshot_timer_start))
                     
                     if remaining <= 0:
-                        # Capture happens here!
-                        pred_char, _ = self.get_prediction(features)
                         self.trigger_snapshot(pred_char)
                         self.snapshot_timer_start = None
                     else:
@@ -170,10 +165,9 @@ class ISLApp:
                                     cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 165, 255), 2)
                 else:
                     self.snapshot_timer_start = None
-                    cv2.putText(frame, "Place hands in box", (self.BOX_X1 + 10, self.BOX_Y1 + 30), 
+                    cv2.putText(frame, "Hold sign in box clearly", (self.BOX_X1 + 10, self.BOX_Y1 + 30), 
                                 cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 255, 255), 2)
                                 
-            # Flash effect
             if self.flash_frames > 0:
                 frame[:] = 255
                 self.flash_frames -= 1

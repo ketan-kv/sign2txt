@@ -16,11 +16,11 @@ def main():
         print("Error: data/landmarks.csv not found. Run preprocess.py first.")
         return
         
-    if df.shape[1] != 133:
-        raise ValueError(f"Expected 133 columns (1 label + 132 features), got {df.shape[1]}")
+    if df.shape[1] != 127:
+        raise ValueError(f"Expected 127 columns (1 label + 126 features), got {df.shape[1]}")
         
-    X = df.iloc[:, 1:].values
     y_raw = df.iloc[:, 0].astype(str).values
+    X = df.iloc[:, 1:].values
     
     le = LabelEncoder()
     y = le.fit_transform(y_raw)
@@ -36,9 +36,9 @@ def main():
         X, y, test_size=0.2, stratify=y, random_state=42
     )
     
-    # Built to handle 132 features and robust against overfitting (Dropout 0.4)
+    # Built to handle 126 features
     model = Sequential([
-        Dense(256, activation='relu', input_shape=(132,)),
+        Dense(256, activation='relu', input_shape=(126,)),
         BatchNormalization(),
         Dropout(0.4),
         Dense(128, activation='relu'),
