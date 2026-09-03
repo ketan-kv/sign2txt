@@ -1,120 +1,91 @@
 import os
+import cv2
 import json
+import numpy as np
 import tensorflow as tf
-from tensorflow.keras.applications import MobileNetV2
-from tensorflow.keras.layers import Dense, GlobalAveragePooling2D, Dropout, Input
-from tensorflow.keras.models import Model
-from tensorflow.keras.preprocessing.image import ImageDataGenerator
-from tensorflow.keras.callbacks import EarlyStopping, ReduceLROnPlateau
+from tensorflow.keras.models import Sequential
+from tensorflow.keras.layers import Conv2D, MaxPooling2D, Flatten, Dense, Dropout
+from tensorflow.keras.callbacks import EarlyStopping
+from sklearn.model_selection import train_test_split
+from image_utils import get_canny_edge
 
 DATASET_DIR = "dataset"
-IMG_SIZE = 224
-BATCH_SIZE = 32
+IMG_SIZE = 128
 
-def main():
+def load_data():
+    X, y = [], []
     if not os.path.exists(DATASET_DIR):
-        print("Error: dataset/ folder not found.")
-        return
+        print(f"Error: {DATASET_DIR} folder not found.")
+        return np.array([]), np.array([]), 0
 
     classes = sorted([d for d in os.listdir(DATASET_DIR) if os.path.isdir(os.path.join(DATASET_DIR, d))])
-    num_classes = len(classes)
-    print(f"Found {num_classes} classes.")
-
-    # Save class names mapping for app.py
+    
     label_map = {str(i): cls for i, cls in enumerate(classes)}
     with open("labels.json", "w") as f:
         json.dump(label_map, f)
-
-    # Heavy Data Augmentation to bridge the domain gap (black bg -> webcam)
-    # Brightness and contrast shifts are critical here.
-    train_datagen = ImageDataGenerator(
-        rescale=1./255,
-        validation_split=0.2,
-        rotation_range=15,
-        width_shift_range=0.1,
-        height_shift_range=0.1,
-        zoom_range=0.1,
-        brightness_range=[0.7, 1.3],
-        horizontal_flip=False, # Do NOT flip ISL signs, handedness matters
-        fill_mode='nearest'
-    )
-
-    train_generator = train_datagen.flow_from_directory(
-        DATASET_DIR,
-        target_size=(IMG_SIZE, IMG_SIZE),
-        batch_size=BATCH_SIZE,
-        class_mode='categorical',
-        subset='training',
-        shuffle=True
-    )
-
-    val_generator = train_datagen.flow_from_directory(
-        DATASET_DIR,
-        target_size=(IMG_SIZE, IMG_SIZE),
-        batch_size=BATCH_SIZE,
-        class_mode='categorical',
-        subset='validation'
-    )
-
-    # Transfer Learning: MobileNetV2 Base (Pre-trained on ImageNet)
-    base_model = MobileNetV2(
-        weights='imagenet', 
-        include_top=False, 
-        input_tensor=Input(shape=(IMG_SIZE, IMG_SIZE, 3))
-    )
-    
-    # Freeze the base model to prevent destroying pre-trained weights initially
-    base_model.trainable = False
-
-    # Add custom classification head
-    x = base_model.output
-    x = GlobalAveragePooling2D()(x)
-    x = Dense(256, activation='relu')(x)
-    x = Dropout(0.5)(x)
-    predictions = Dense(num_classes, activation='softmax')(x)
-
-    model = Model(inputs=base_model.input, outputs=predictions)
-
-    model.compile(
-        optimizer=tf.keras.optimizers.Adam(learning_rate=0.001),
-        loss='categorical_crossentropy',
-        metrics=['accuracy']
-    )
-
-    callbacks = [
-        EarlyStopping(monitor='val_loss', patience=4, restore_best_weights=True, verbose=1),
-        ReduceLROnPlateau(monitor='val_loss', factor=0.5, patience=2, verbose=1)
-    ]
-
-    print("\nPhase 1: Training the custom head (Base frozen)...")
-    model.fit(
-        train_generator,
-        validation_data=val_generator,
-        epochs=15,
-        callbacks=callbacks
-    )
-
-    print("\nPhase 2: Fine-tuning top layers of MobileNetV2...")
-    # Unfreeze the top layers of MobileNetV2 for fine-tuning
-    base_model.trainable = True
-    for layer in base_model.layers[:-20]: # Keep early feature extractors frozen
-        layer.trainable = False
         
-    model.compile(
-        optimizer=tf.keras.optimizers.Adam(learning_rate=1e-5), # Tiny learning rate for fine-tuning
-        loss='categorical_crossentropy',
-        metrics=['accuracy']
-    )
+    for i, cls in enumerate(classes):
+        cls_dir = os.path.join(DATASET_DIR, cls)
+        for img_name in os.listdir(cls_dir):
+            img_path = os.path.join(cls_dir, img_name)
+            img = cv2.imread(img_path)
+            if img is None: continue
+            
+            # Apply identical preprocessing as live inference
+            img = cv2.resize(img, (IMG_SIZE, IMG_SIZE))
+            edges = get_canny_edge(img)
+            
+            # Normalize and format to (128, 128, 1)
+            edges = edges.astype('float32') / 255.0
+            edges = np.expand_dims(edges, axis=-1)
+            
+            X.append(edges)
+            y.append(i)
+            
+    return np.array(X), np.array(y), len(classes)
 
-    model.fit(
-        train_generator,
-        validation_data=val_generator,
-        epochs=10,
-        callbacks=callbacks
-    )
-
-    model.save("isl_cnn_model.keras")
-    print("\nTraining complete! Saved to isl_cnn_model.keras")
+def build_model(num_classes):
+    # Literature-validated lightweight Tier 1 Architecture
+    model = Sequential([
+        Conv2D(32, (3,3), activation='relu', input_shape=(IMG_SIZE, IMG_SIZE, 1)),
+        MaxPooling2D(2, 2),
+        Conv2D(64, (3,3), activation='relu'),
+        MaxPooling2D(2, 2),
+        Conv2D(128, (3,3), activation='relu'),
+        MaxPooling2D(2, 2),
+        Flatten(),
+        Dense(128, activation='relu'),
+        Dropout(0.5),
+        Dense(num_classes, activation='softmax')
+    ])
+    model.compile(optimizer='adam', loss='sparse_categorical_crossentropy', metrics=['accuracy'])
+    return model
 
 if __name__ == "__main__":
-    main()
+    print("Loading and converting dataset into 1-channel Canny Edge maps...")
+    X, y, num_classes = load_data()
+    
+    if len(X) == 0:
+        print("No images found to train on. Exiting.")
+        exit()
+        
+    print(f"Loaded {len(X)} images across {num_classes} classes.")
+    
+    X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, random_state=42)
+    
+    model = build_model(num_classes)
+    model.summary()
+    
+    early_stop = EarlyStopping(monitor='val_loss', patience=5, restore_best_weights=True, verbose=1)
+    
+    print("\nTraining Tier-1 Custom Edge-CNN...")
+    model.fit(
+        X_train, y_train, 
+        validation_data=(X_test, y_test), 
+        epochs=30, 
+        batch_size=32, 
+        callbacks=[early_stop]
+    )
+    
+    model.save("isl_cnn_model.keras")
+    print("\nTraining complete! Saved to isl_cnn_model.keras")

@@ -7,11 +7,12 @@ import numpy as np
 import json
 import os
 import time
+from image_utils import preprocess_for_cnn
 
 class ISLApp:
     def __init__(self, root):
         self.root = root
-        self.root.title("ISL Detection - CNN Guide Box Mode")
+        self.root.title("ISL Detection - Tier-1 Edge CNN")
         self.root.geometry("800x800")
         self.root.configure(bg="#2b2b2b")
         
@@ -22,22 +23,18 @@ class ISLApp:
             
         self.model = tf.keras.models.load_model("isl_cnn_model.keras")
         with open("labels.json", "r") as f:
-            # Re-map keys from string to int since dict keys are saved as strings in JSON
             raw_map = json.load(f)
             self.class_names = {int(k): v for k, v in raw_map.items()}
             
         self.cap = cv2.VideoCapture(0)
         
-        # Snapshot Mode State
         self.snapshot_timer_start = None
         self.cooldown_until = 0.0
         self.flash_frames = 0
         
-        # UI & CNN Constants
         self.WIDTH, self.HEIGHT = 640, 480
-        self.CNN_IMG_SIZE = 224
+        self.CNN_IMG_SIZE = 128 # Matching the new custom CNN
         
-        # Target Box taking up central portion of screen
         self.BOX_X1 = int(self.WIDTH * 0.15)
         self.BOX_Y1 = int(self.HEIGHT * 0.15)
         self.BOX_X2 = int(self.WIDTH * 0.85)
@@ -94,22 +91,6 @@ class ISLApp:
         self.cap.release()
         self.root.destroy()
         
-    def predict_crop(self, frame_crop):
-        # Resize crop to MobileNetV2 expected size
-        img = cv2.resize(frame_crop, (self.CNN_IMG_SIZE, self.CNN_IMG_SIZE))
-        # Convert BGR to RGB
-        img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
-        # Normalize 0-1
-        img = img.astype('float32') / 255.0
-        # Expand dims for batch size 1
-        input_data = np.expand_dims(img, axis=0)
-        
-        predictions = self.model(input_data, training=False).numpy()[0]
-        max_idx = np.argmax(predictions)
-        conf = predictions[max_idx]
-        
-        return self.class_names[max_idx], conf
-        
     def trigger_snapshot(self, pred_char):
         if pred_char.lower() == "space":
             self.text_box.insert(tk.END, " ")
@@ -127,30 +108,29 @@ class ISLApp:
             frame = cv2.flip(frame, 1)
             frame = cv2.resize(frame, (self.WIDTH, self.HEIGHT))
             
-            # 1. Physical hard-crop extraction (No MediaPipe)
+            # Extract crop and apply 1-Channel Canny Edge preprocessing
             hand_crop = frame[self.BOX_Y1:self.BOX_Y2, self.BOX_X1:self.BOX_X2]
+            input_data = preprocess_for_cnn(hand_crop, img_size=self.CNN_IMG_SIZE)
             
-            # 2. CNN Prediction
-            pred_char, conf = self.predict_crop(hand_crop)
+            # Predict
+            # input_data is (128, 128, 1), Keras expects batch dim (1, 128, 128, 1)
+            predictions = self.model(np.expand_dims(input_data, axis=0), training=False).numpy()[0]
+            max_idx = np.argmax(predictions)
+            conf = predictions[max_idx]
+            pred_char = self.class_names[max_idx]
             
             # Live Debug Info
             display_text = f"CNN: {pred_char} ({conf*100:.1f}%)"
             color = (0, 255, 0) if conf > 0.7 else (0, 165, 255)
             cv2.putText(frame, display_text, (20, 40), cv2.FONT_HERSHEY_SIMPLEX, 0.8, color, 2)
-            
-            # Draw Target Box
             cv2.rectangle(frame, (self.BOX_X1, self.BOX_Y1), (self.BOX_X2, self.BOX_Y2), color, 2)
             
             current_time = time.time()
-            
-            # Timer Logic
             if current_time < self.cooldown_until:
                 cv2.putText(frame, "Snapshot Captured! Resetting...", (self.BOX_X1 + 10, self.BOX_Y1 + 30), 
                             cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 255), 2)
                 self.snapshot_timer_start = None
             else:
-                # We assume the user has placed their hand in the box. 
-                # If confidence is > 70%, start the 2 second capture timer.
                 if conf > 0.7:
                     if self.snapshot_timer_start is None:
                         self.snapshot_timer_start = current_time
