@@ -198,18 +198,26 @@ class ISLApp:
         self.flash_frames = 0
 
     def add_space(self):
-        self.text_box.insert(tk.END, " ")
-        self.text_box.see(tk.END)
+        current = self.text_box.get("1.0", "end-1c")
+        if current and not current.endswith(" "):
+            self.text_box.insert(tk.END, " ")
+            self.text_box.see(tk.END)
+        self.idle_start_time = time.time()
         
     def clear_text(self):
         self.text_box.delete("1.0", tk.END)
+        self.idle_start_time = time.time()
+        self.auto_space_paused_until = time.time() + 2.5
         
     def backspace(self):
-        current = self.text_box.get("1.0", tk.END)
-        if len(current) > 1:
-            self.text_box.delete("1.0", tk.END)
-            self.text_box.insert(tk.END, current[:-2])
+        content = self.text_box.get("1.0", "end-1c")
+        if len(content) > 0:
+            # Delete exactly the last character (letter or space)
+            self.text_box.delete("end-2c", "end-1c")
             self.text_box.see(tk.END)
+        # Pause auto-space for 2.5s so deleting a space isn't immediately re-added by auto-space!
+        self.auto_space_paused_until = time.time() + 2.5
+        self.idle_start_time = time.time()
             
     def save_file(self):
         fp = filedialog.asksaveasfilename(defaultextension=".txt", filetypes=[("Text", "*.txt")])
@@ -258,6 +266,9 @@ class ISLApp:
 
     def check_auto_space(self, current_time):
         """Automatically appends space when hands remain absent for auto_space_delay."""
+        if hasattr(self, "auto_space_paused_until") and current_time < self.auto_space_paused_until:
+            return "Auto-Space Paused"
+            
         if self.idle_start_time is None:
             self.idle_start_time = current_time
             return None
@@ -266,9 +277,10 @@ class ISLApp:
         remaining = max(0.0, self.auto_space_delay - idle_duration)
         
         if remaining <= 0.0:
-            current_text = self.text_box.get("1.0", tk.END).rstrip("\n")
+            current_text = self.text_box.get("1.0", "end-1c")
             if current_text and not current_text.endswith(" "):
-                self.add_space()
+                self.text_box.insert(tk.END, " ")
+                self.text_box.see(tk.END)
                 self.flash_frames = 1
             # Reset timer so we don't spam spaces indefinitely
             self.idle_start_time = current_time
