@@ -82,9 +82,10 @@ class ISLApp:
         self.flash_frames = 0
         
         # --- Continuous Mode State Machine ---
-        self.pred_buffer = deque(maxlen=12)
-        self.min_consensus_count = 9
-        self.min_confidence = 0.65
+        # Highly responsive buffer: 8 frames (~200-250ms window)
+        self.pred_buffer = deque(maxlen=8)
+        self.min_consensus_count = 5      # 5 of 8 frames (~62%) to lock in quickly
+        self.min_confidence = 0.50         # Responsive confidence threshold
         self.locked_symbol = None
         self.continuous_cooldown_until = 0.0
         self.idle_start_time = None
@@ -358,7 +359,7 @@ class ISLApp:
             return "Auto-Spaced"
         return f"Auto-Space in {remaining:.1f}s"
 
-    def handle_continuous_mode(self, frame, in_box, features, current_time):
+    def handle_continuous_mode(self, frame, in_box, features, current_time, pred_char, conf):
         if not in_box or np.all(features == 0.0):
             self.pred_buffer.clear()
             self.locked_symbol = None
@@ -375,8 +376,7 @@ class ISLApp:
                         cv2.FONT_HERSHEY_SIMPLEX, 0.75, (0, 255, 255), 2)
             return
             
-        pred_char, conf = self.get_prediction(features)
-        
+        # Re-use pre-calculated prediction (zero redundant inference!)
         if conf >= self.min_confidence and pred_char != "None":
             self.pred_buffer.append(pred_char)
         else:
@@ -384,12 +384,12 @@ class ISLApp:
 
         if self.locked_symbol is not None:
             locked_occurrences = self.pred_buffer.count(self.locked_symbol)
-            if locked_occurrences < 3:
+            if locked_occurrences < 2:
                 self.locked_symbol = None
 
         valid_preds = [p for p in self.pred_buffer if p is not None]
         
-        if len(valid_preds) >= 6:
+        if len(valid_preds) >= 4:
             candidate, count = Counter(valid_preds).most_common(1)[0]
             
             progress_ratio = min(1.0, count / float(self.min_consensus_count))
@@ -410,7 +410,7 @@ class ISLApp:
                 self.trigger_char_emit(candidate, is_continuous=True)
                 self.locked_symbol = candidate
                 self.pred_buffer.clear()
-                self.continuous_cooldown_until = current_time + 0.35
+                self.continuous_cooldown_until = current_time + 0.25
             else:
                 cv2.putText(frame, f"Stabilizing: {candidate} ({count}/{self.min_consensus_count})", 
                             (self.BOX_X1 + 10, self.BOX_Y1 + 32), 
@@ -419,7 +419,7 @@ class ISLApp:
             cv2.putText(frame, "Analyzing Gesture...", (self.BOX_X1 + 10, self.BOX_Y1 + 32), 
                         cv2.FONT_HERSHEY_SIMPLEX, 0.75, (160, 160, 160), 2)
 
-    def handle_snapshot_mode(self, frame, in_box, features, current_time):
+    def handle_snapshot_mode(self, frame, in_box, features, current_time, pred_char, conf):
         if current_time < self.cooldown_until:
             cv2.putText(frame, "Snapshot Captured! Resetting...", (self.BOX_X1 + 10, self.BOX_Y1 + 32), 
                         cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 255), 2)
@@ -442,7 +442,6 @@ class ISLApp:
                 )
                 
                 if remaining <= 0:
-                    pred_char, _ = self.get_prediction(features)
                     self.trigger_char_emit(pred_char, is_continuous=False)
                     self.snapshot_timer_start = None
                 else:
@@ -545,12 +544,13 @@ class ISLApp:
                         in_box = False
                         break
                         
+            pred_char, conf = "None", 0.0
             display_text = "Prediction: None"
             color = (120, 120, 120)
             if not np.all(features == 0.0):
                 pred_char, conf = self.get_prediction(features)
                 display_text = f"Live: {pred_char} ({conf*100:.1f}%)"
-                color = (0, 255, 0) if conf > 0.65 else (0, 165, 255)
+                color = (0, 255, 0) if conf > 0.50 else (0, 165, 255)
                 
             cv2.putText(frame, display_text, (20, 36), cv2.FONT_HERSHEY_SIMPLEX, 0.8, color, 2)
             
@@ -560,9 +560,9 @@ class ISLApp:
             current_time = time.time()
             
             if self.mode == "snapshot":
-                self.handle_snapshot_mode(frame, in_box, features, current_time)
+                self.handle_snapshot_mode(frame, in_box, features, current_time, pred_char, conf)
             else:
-                self.handle_continuous_mode(frame, in_box, features, current_time)
+                self.handle_continuous_mode(frame, in_box, features, current_time, pred_char, conf)
                                 
             if self.flash_frames > 0:
                 frame[:] = 255
@@ -577,7 +577,7 @@ class ISLApp:
         except Exception as e:
             print(f"Unexpected loop exception: {e}")
             
-        self.root.after(30, self.update_frame)
+        self.root.after(10, self.update_frame)
 
 if __name__ == "__main__":
     root = tk.Tk()
