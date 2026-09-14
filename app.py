@@ -1,20 +1,23 @@
 import cv2
 import tkinter as tk
-from tkinter import filedialog, messagebox
+from tkinter import filedialog, messagebox, ttk
 from PIL import Image, ImageTk
 import tensorflow as tf
 import numpy as np
 import json
 import os
 import time
+import threading
 from collections import deque, Counter
 from extractor import MediaPipeExtractor
+from translator import SignTranslator
+from tts import SpeechEngine
 
 class ISLApp:
     def __init__(self, root):
         self.root = root
-        self.root.title("ISL Sign2Txt - Multi-Mode Detection")
-        self.root.geometry("820x860")
+        self.root.title("ISL Sign2Txt - Detection, Translation & Speech")
+        self.root.geometry("860x960")
         self.root.configure(bg="#1e1e1e")
         
         # 1. Defensive Startup Checks
@@ -28,7 +31,6 @@ class ISLApp:
             
         try:
             self.model = tf.keras.models.load_model("isl_dnn_model.keras")
-            # Verify input shape
             expected_features = 132
             if self.model.input_shape[-1] != expected_features:
                 messagebox.showerror(
@@ -57,6 +59,10 @@ class ISLApp:
             self.root.destroy()
             return
 
+        # Initialize Translation and Speech Engines
+        self.translator = SignTranslator()
+        self.speech_engine = SpeechEngine()
+
         self.cap = cv2.VideoCapture(0)
         self.consecutive_cam_fails = 0
         
@@ -76,22 +82,22 @@ class ISLApp:
         self.flash_frames = 0
         
         # --- Continuous Mode State Machine ---
-        # Buffer size of 12 frames (~350-400ms window)
         self.pred_buffer = deque(maxlen=12)
-        self.min_consensus_count = 9      # At least 9 of 12 frames (~75%) must agree
-        self.min_confidence = 0.65         # Minimum confidence to accept a frame
-        self.locked_symbol = None          # Prevents runaway spam (e.g. AAAAA)
+        self.min_consensus_count = 9
+        self.min_confidence = 0.65
+        self.locked_symbol = None
         self.continuous_cooldown_until = 0.0
-        self.idle_start_time = None        # Tracks absence of hands for auto-space
-        self.auto_space_delay = 1.6        # 1.6 seconds without hands triggers space
+        self.idle_start_time = None
+        self.auto_space_delay = 1.6
+        self.auto_space_paused_until = 0.0
         
         self.setup_ui()
         self.update_frame()
         
     def setup_ui(self):
-        # Header / Status Frame
+        # Header Frame
         header_frame = tk.Frame(self.root, bg="#1e1e1e")
-        header_frame.pack(fill=tk.X, padx=20, pady=(10, 5))
+        header_frame.pack(fill=tk.X, padx=20, pady=(8, 4))
         
         title_label = tk.Label(
             header_frame, text="ISL Sign2Txt Assistant", 
@@ -110,62 +116,129 @@ class ISLApp:
         
         # Video Display Label
         self.vid_label = tk.Label(self.root, bg="#111111", bd=2, relief=tk.SOLID)
-        self.vid_label.pack(pady=5)
+        self.vid_label.pack(pady=3)
         
         # Mode Explanation Banner
         self.lbl_mode_info = tk.Label(
             self.root, 
             text="[Snapshot Mode] Hold your sign inside the box for 2 seconds to capture.",
-            font=("Helvetica", 11, "italic"), fg="#bbbbbb", bg="#1e1e1e"
+            font=("Helvetica", 10, "italic"), fg="#bbbbbb", bg="#1e1e1e"
         )
-        self.lbl_mode_info.pack(pady=(0, 5))
+        self.lbl_mode_info.pack(pady=(0, 2))
         
-        # Predicted Text Output Box
+        # Section 1: Recognized Text
+        text_label = tk.Label(
+            self.root, text="Recognized English Text:", 
+            font=("Helvetica", 10, "bold"), fg="#b0bec5", bg="#1e1e1e"
+        )
+        text_label.pack(anchor=tk.W, padx=20, pady=(2, 0))
+
         self.text_box = tk.Text(
-            self.root, height=3, width=42, 
-            font=("Helvetica", 22, "bold"), bg="#f8f9fa", fg="#212529",
+            self.root, height=2, width=48, 
+            font=("Helvetica", 18, "bold"), bg="#f8f9fa", fg="#212529",
             bd=2, relief=tk.SUNKEN, wrap=tk.WORD
         )
-        self.text_box.pack(pady=5, padx=20)
+        self.text_box.pack(pady=(0, 4), padx=20)
         
         # Control Buttons Frame
         btn_frame = tk.Frame(self.root, bg="#1e1e1e")
-        btn_frame.pack(pady=10)
+        btn_frame.pack(pady=2)
         
         self.btn_space = tk.Button(
-            btn_frame, text="Space", font=("Helvetica", 12, "bold"), 
+            btn_frame, text="Space", font=("Helvetica", 11, "bold"), 
             bg="#2e7d32", fg="white", activebackground="#1b5e20", activeforeground="white",
-            width=10, command=self.add_space
+            width=8, command=self.add_space
         )
-        self.btn_space.grid(row=0, column=0, padx=6, pady=5, ipady=4)
+        self.btn_space.grid(row=0, column=0, padx=4, pady=2, ipady=2)
         
         self.btn_backspace = tk.Button(
-            btn_frame, text="Backspace", font=("Helvetica", 12, "bold"), 
+            btn_frame, text="Backspace", font=("Helvetica", 11, "bold"), 
             bg="#f57c00", fg="white", activebackground="#e65100", activeforeground="white",
             width=10, command=self.backspace
         )
-        self.btn_backspace.grid(row=0, column=1, padx=6, pady=5, ipady=4)
+        self.btn_backspace.grid(row=0, column=1, padx=4, pady=2, ipady=2)
         
         self.btn_clear = tk.Button(
-            btn_frame, text="Clear All", font=("Helvetica", 12, "bold"), 
+            btn_frame, text="Clear All", font=("Helvetica", 11, "bold"), 
             bg="#d32f2f", fg="white", activebackground="#b71c1c", activeforeground="white",
-            width=10, command=self.clear_text
+            width=9, command=self.clear_text
         )
-        self.btn_clear.grid(row=0, column=2, padx=6, pady=5, ipady=4)
+        self.btn_clear.grid(row=0, column=2, padx=4, pady=2, ipady=2)
         
         self.btn_save = tk.Button(
-            btn_frame, text="Save to File", font=("Helvetica", 12, "bold"), 
+            btn_frame, text="Save Text", font=("Helvetica", 11, "bold"), 
             bg="#1976d2", fg="white", activebackground="#0d47a1", activeforeground="white",
-            width=12, command=self.save_file
+            width=10, command=self.save_file
         )
-        self.btn_save.grid(row=0, column=3, padx=6, pady=5, ipady=4)
+        self.btn_save.grid(row=0, column=3, padx=4, pady=2, ipady=2)
         
         self.btn_quit = tk.Button(
-            btn_frame, text="Quit", font=("Helvetica", 12, "bold"), 
+            btn_frame, text="Quit", font=("Helvetica", 11, "bold"), 
             bg="#616161", fg="white", activebackground="#424242", activeforeground="white",
-            width=8, command=self.quit_app
+            width=7, command=self.quit_app
         )
-        self.btn_quit.grid(row=0, column=4, padx=6, pady=5, ipady=4)
+        self.btn_quit.grid(row=0, column=4, padx=4, pady=2, ipady=2)
+
+        # Section 2: AI Translation & Speech Panel
+        trans_frame = tk.LabelFrame(
+            self.root, text=" AI Translation & Speech (Gemini) ", 
+            font=("Helvetica", 11, "bold"), fg="#81c784", bg="#1e1e1e", bd=1
+        )
+        trans_frame.pack(fill=tk.X, padx=20, pady=6)
+        
+        # Translation Controls Row
+        ctrl_row = tk.Frame(trans_frame, bg="#1e1e1e")
+        ctrl_row.pack(fill=tk.X, padx=10, pady=4)
+        
+        tk.Label(
+            ctrl_row, text="Target Language:", font=("Helvetica", 10, "bold"), 
+            fg="#e0e0e0", bg="#1e1e1e"
+        ).pack(side=tk.LEFT, padx=(0, 4))
+        
+        self.combo_lang = ttk.Combobox(
+            ctrl_row, values=[
+                "Hindi", "Tamil", "Telugu", "Kannada", "Malayalam", "Bengali", 
+                "Marathi", "Gujarati", "Spanish", "French", "German", "Japanese"
+            ], state="readonly", width=12, font=("Helvetica", 10)
+        )
+        self.combo_lang.set("Hindi")
+        self.combo_lang.pack(side=tk.LEFT, padx=4)
+        
+        self.btn_translate = tk.Button(
+            ctrl_row, text="✨ AI Translate & Fix", font=("Helvetica", 10, "bold"),
+            bg="#0288d1", fg="white", activebackground="#01579b", activeforeground="white",
+            command=self.run_translation
+        )
+        self.btn_translate.pack(side=tk.LEFT, padx=6)
+        
+        self.btn_speak_trans = tk.Button(
+            ctrl_row, text="🔊 Speak (Translation)", font=("Helvetica", 10, "bold"),
+            bg="#7b1fa2", fg="white", activebackground="#4a148c", activeforeground="white",
+            command=self.speak_translation
+        )
+        self.btn_speak_trans.pack(side=tk.LEFT, padx=4)
+
+        self.btn_speak_orig = tk.Button(
+            ctrl_row, text="🔊 Speak (English)", font=("Helvetica", 10, "bold"),
+            bg="#455a64", fg="white", activebackground="#263238", activeforeground="white",
+            command=self.speak_original
+        )
+        self.btn_speak_orig.pack(side=tk.LEFT, padx=4)
+        
+        # Translation Status Label
+        self.lbl_trans_status = tk.Label(
+            trans_frame, text="Ready — Click 'AI Translate & Fix' to correct typos and translate.", 
+            font=("Helvetica", 9, "italic"), fg="#aaaaaa", bg="#1e1e1e"
+        )
+        self.lbl_trans_status.pack(anchor=tk.W, padx=10, pady=(1, 2))
+        
+        # Translated Output Text Box
+        self.trans_text_box = tk.Text(
+            trans_frame, height=2, width=48, 
+            font=("Helvetica", 18, "bold"), bg="#263238", fg="#80cbc4",
+            bd=2, relief=tk.SUNKEN, wrap=tk.WORD
+        )
+        self.trans_text_box.pack(fill=tk.X, padx=10, pady=(2, 6))
 
     def toggle_mode(self):
         """Flushes states and toggles between Snapshot and Continuous mode."""
@@ -188,7 +261,6 @@ class ISLApp:
                 text="[Snapshot Mode] Hold your sign inside the box for 2 seconds to capture."
             )
             
-        # Flush all state variables to prevent cross-mode pollution
         self.snapshot_timer_start = None
         self.cooldown_until = 0.0
         self.pred_buffer.clear()
@@ -206,16 +278,16 @@ class ISLApp:
         
     def clear_text(self):
         self.text_box.delete("1.0", tk.END)
+        self.trans_text_box.delete("1.0", tk.END)
         self.idle_start_time = time.time()
         self.auto_space_paused_until = time.time() + 2.5
+        self.lbl_trans_status.config(text="Ready", fg="#aaaaaa")
         
     def backspace(self):
         content = self.text_box.get("1.0", "end-1c")
         if len(content) > 0:
-            # Delete exactly the last character (letter or space)
             self.text_box.delete("end-2c", "end-1c")
             self.text_box.see(tk.END)
-        # Pause auto-space for 2.5s so deleting a space isn't immediately re-added by auto-space!
         self.auto_space_paused_until = time.time() + 2.5
         self.idle_start_time = time.time()
             
@@ -223,8 +295,11 @@ class ISLApp:
         fp = filedialog.asksaveasfilename(defaultextension=".txt", filetypes=[("Text", "*.txt")])
         if fp:
             try:
-                with open(fp, "w") as f:
-                    f.write(self.text_box.get("1.0", tk.END))
+                with open(fp, "w", encoding="utf-8") as f:
+                    f.write("=== Recognized English ===\n")
+                    f.write(self.text_box.get("1.0", tk.END).strip() + "\n\n")
+                    f.write(f"=== Translation ({self.combo_lang.get()}) ===\n")
+                    f.write(self.trans_text_box.get("1.0", tk.END).strip() + "\n")
             except Exception as e:
                 messagebox.showerror("Save Error", f"Could not save file:\n{e}")
                 
@@ -250,7 +325,6 @@ class ISLApp:
             return "None", 0.0
         
     def trigger_char_emit(self, pred_char, is_continuous=False):
-        """Appends character to text box and handles special control characters."""
         if pred_char.lower() == "space":
             self.add_space()
         elif pred_char.lower() in ["delete", "del", "backspace"]:
@@ -259,13 +333,11 @@ class ISLApp:
             self.text_box.insert(tk.END, pred_char)
             self.text_box.see(tk.END)
             
-        # Visual flash indicator
         self.flash_frames = 2 if is_continuous else 4
         if not is_continuous:
             self.cooldown_until = time.time() + 1.5
 
     def check_auto_space(self, current_time):
-        """Automatically appends space when hands remain absent for auto_space_delay."""
         if hasattr(self, "auto_space_paused_until") and current_time < self.auto_space_paused_until:
             return "Auto-Space Paused"
             
@@ -282,15 +354,12 @@ class ISLApp:
                 self.text_box.insert(tk.END, " ")
                 self.text_box.see(tk.END)
                 self.flash_frames = 1
-            # Reset timer so we don't spam spaces indefinitely
             self.idle_start_time = current_time
             return "Auto-Spaced"
         return f"Auto-Space in {remaining:.1f}s"
 
     def handle_continuous_mode(self, frame, in_box, features, current_time):
-        """Manages the 5-state temporal consensus engine for stream signing."""
         if not in_box or np.all(features == 0.0):
-            # State: IDLE / Hands Absent
             self.pred_buffer.clear()
             self.locked_symbol = None
             status_text = self.check_auto_space(current_time)
@@ -299,37 +368,30 @@ class ISLApp:
                         cv2.FONT_HERSHEY_SIMPLEX, 0.75, (200, 200, 200), 2)
             return
 
-        # Hands present: reset idle auto-space timer
         self.idle_start_time = None
         
-        # State: COOLDOWN (Refractory period right after an emission)
         if current_time < self.continuous_cooldown_until:
             cv2.putText(frame, "Refractory Cooldown...", (self.BOX_X1 + 10, self.BOX_Y1 + 32), 
                         cv2.FONT_HERSHEY_SIMPLEX, 0.75, (0, 255, 255), 2)
             return
             
-        # State: STABILIZING (Collecting frame predictions)
         pred_char, conf = self.get_prediction(features)
         
         if conf >= self.min_confidence and pred_char != "None":
             self.pred_buffer.append(pred_char)
         else:
-            self.pred_buffer.append(None) # Represents an ambiguous/transitional frame
+            self.pred_buffer.append(None)
 
-        # Check unlocked condition: if buffer has moved away from the locked symbol
         if self.locked_symbol is not None:
             locked_occurrences = self.pred_buffer.count(self.locked_symbol)
-            # If the locked symbol is now rare in the buffer (< 3 frames), unlock it!
             if locked_occurrences < 3:
                 self.locked_symbol = None
 
-        # Compute consensus from valid predictions in the buffer
         valid_preds = [p for p in self.pred_buffer if p is not None]
         
         if len(valid_preds) >= 6:
             candidate, count = Counter(valid_preds).most_common(1)[0]
             
-            # Draw live consensus progress bar
             progress_ratio = min(1.0, count / float(self.min_consensus_count))
             bar_w = int((self.BOX_X2 - self.BOX_X1 - 20) * progress_ratio)
             cv2.rectangle(
@@ -341,12 +403,10 @@ class ISLApp:
             )
             
             if candidate == self.locked_symbol:
-                # State: LOCKED (Prevent duplicate spam)
                 cv2.putText(frame, f"Locked: {candidate} (Change sign to continue)", 
                             (self.BOX_X1 + 10, self.BOX_Y1 + 32), 
                             cv2.FONT_HERSHEY_SIMPLEX, 0.75, (0, 255, 0), 2)
             elif count >= self.min_consensus_count:
-                # State: EMIT
                 self.trigger_char_emit(candidate, is_continuous=True)
                 self.locked_symbol = candidate
                 self.pred_buffer.clear()
@@ -360,7 +420,6 @@ class ISLApp:
                         cv2.FONT_HERSHEY_SIMPLEX, 0.75, (160, 160, 160), 2)
 
     def handle_snapshot_mode(self, frame, in_box, features, current_time):
-        """Manages the proven 2.0s countdown Snapshot Mode from Stage 1."""
         if current_time < self.cooldown_until:
             cv2.putText(frame, "Snapshot Captured! Resetting...", (self.BOX_X1 + 10, self.BOX_Y1 + 32), 
                         cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 255), 2)
@@ -373,7 +432,6 @@ class ISLApp:
                 elapsed = current_time - self.snapshot_timer_start
                 remaining = max(0.0, 2.0 - elapsed)
                 
-                # Draw countdown progress bar
                 prog = min(1.0, elapsed / 2.0)
                 bar_w = int((self.BOX_X2 - self.BOX_X1 - 20) * prog)
                 cv2.rectangle(
@@ -395,13 +453,66 @@ class ISLApp:
                 cv2.putText(frame, "Place hands in box", (self.BOX_X1 + 10, self.BOX_Y1 + 32), 
                             cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 255, 255), 2)
 
+    # --- Translation and Speech Handlers ---
+    def run_translation(self):
+        raw_text = self.text_box.get("1.0", "end-1c").strip()
+        if not raw_text:
+            self.lbl_trans_status.config(text="Nothing to translate! Sign some letters first.", fg="#ff9800")
+            return
+            
+        target_lang = self.combo_lang.get()
+        self.lbl_trans_status.config(text=f"Translating to {target_lang} with Gemini AI...", fg="#29b6f6")
+        self.btn_translate.config(state=tk.DISABLED)
+        
+        def _worker():
+            res = self.translator.translate(raw_text, target_language=target_lang)
+            self.root.after(0, lambda: self._on_translation_done(res))
+            
+        threading.Thread(target=_worker, daemon=True).start()
+        
+    def _on_translation_done(self, res):
+        self.btn_translate.config(state=tk.NORMAL)
+        corrected = res.get("corrected_english", "")
+        translated = res.get("translated_text", "")
+        engine = res.get("engine", "")
+        
+        # Update English text box with AI-repaired version if available
+        if corrected and engine == "gemini":
+            self.text_box.delete("1.0", tk.END)
+            self.text_box.insert(tk.END, corrected)
+            self.text_box.see(tk.END)
+            
+        self.trans_text_box.delete("1.0", tk.END)
+        self.trans_text_box.insert(tk.END, translated)
+        self.trans_text_box.see(tk.END)
+        
+        if engine == "gemini":
+            self.lbl_trans_status.config(text="Translated & Typos Fixed via Gemini 3.6 Flash! ✨", fg="#66bb6a")
+        elif engine == "fallback":
+            self.lbl_trans_status.config(text="Translated via Google Translator fallback.", fg="#ffd54f")
+        else:
+            self.lbl_trans_status.config(text="Translation error. Check connection.", fg="#ef5350")
+            
+    def speak_translation(self):
+        text = self.trans_text_box.get("1.0", "end-1c").strip()
+        if text:
+            self.speech_engine.speak(text)
+        else:
+            self.lbl_trans_status.config(text="No translated text to speak!", fg="#ff9800")
+            
+    def speak_original(self):
+        text = self.text_box.get("1.0", "end-1c").strip()
+        if text:
+            self.speech_engine.speak(text)
+        else:
+            self.lbl_trans_status.config(text="No English text to speak!", fg="#ff9800")
+
     def update_frame(self):
         try:
             ret, frame = self.cap.read()
             if not ret or frame is None:
                 self.consecutive_cam_fails += 1
                 if self.consecutive_cam_fails > 10:
-                    # Draw camera disconnected graphic
                     blank = np.zeros((self.HEIGHT, self.WIDTH, 3), dtype=np.uint8)
                     cv2.putText(blank, "CAMERA NOT AVAILABLE / DISCONNECTED", (30, 240), 
                                 cv2.FONT_HERSHEY_SIMPLEX, 0.75, (0, 0, 255), 2)
@@ -416,7 +527,6 @@ class ISLApp:
             frame = cv2.flip(frame, 1)
             frame = cv2.resize(frame, (self.WIDTH, self.HEIGHT))
             
-            # Landmark extraction & rendering
             try:
                 features, results = self.extractor.extract(frame)
                 frame = self.extractor.draw_landmarks(frame, results)
@@ -425,7 +535,6 @@ class ISLApp:
                 features = np.zeros(132, dtype=np.float32)
                 results = None
             
-            # Check if all detected hands are within target bounding box
             in_box = False
             if results and results.hand_landmarks:
                 in_box = True
@@ -436,7 +545,6 @@ class ISLApp:
                         in_box = False
                         break
                         
-            # Real-time top display overlay
             display_text = "Prediction: None"
             color = (120, 120, 120)
             if not np.all(features == 0.0):
@@ -446,24 +554,20 @@ class ISLApp:
                 
             cv2.putText(frame, display_text, (20, 36), cv2.FONT_HERSHEY_SIMPLEX, 0.8, color, 2)
             
-            # Draw Target Box outline
             box_color = (0, 255, 0) if in_box else (100, 100, 100)
             cv2.rectangle(frame, (self.BOX_X1, self.BOX_Y1), (self.BOX_X2, self.BOX_Y2), box_color, 2)
             
             current_time = time.time()
             
-            # Dispatch to active mode engine
             if self.mode == "snapshot":
                 self.handle_snapshot_mode(frame, in_box, features, current_time)
             else:
                 self.handle_continuous_mode(frame, in_box, features, current_time)
                                 
-            # Screen Flash Effect
             if self.flash_frames > 0:
                 frame[:] = 255
                 self.flash_frames -= 1
             
-            # Render frame to Tkinter
             cv_img = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
             img = Image.fromarray(cv_img)
             imgtk = ImageTk.PhotoImage(image=img)
