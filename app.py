@@ -16,7 +16,7 @@ from tts import SpeechEngine
 class ISLApp:
     def __init__(self, root):
         self.root = root
-        self.root.title("ISL Sign2Txt - Detection, Translation & Speech")
+        self.root.title("ISL Sign2Txt - Real-Time Stream, Translation & Speech")
         self.root.geometry("860x960")
         self.root.configure(bg="#1e1e1e")
         
@@ -73,24 +73,28 @@ class ISLApp:
         self.BOX_X2 = int(self.WIDTH * 0.85)
         self.BOX_Y2 = int(self.HEIGHT * 0.85)
         
-        # Mode Management: "snapshot" or "continuous"
-        self.mode = "snapshot"
+        # Mode Management: Continuous Stream (default) vs Snapshot (timer)
+        self.mode = "continuous"
+        
+        # --- Visual Feedback State (No full-screen flashes!) ---
+        self.box_glow_frames = 0
+        self.last_emitted_char = ""
+        
+        # --- Continuous Stream State Machine ---
+        # Short 6-frame window (~150-180ms) for snappy peak detection
+        self.stream_buffer = deque(maxlen=6)
+        self.min_commit_frames = 4         # Must hold gesture steadily for 4 frames
+        self.min_stream_conf = 0.60        # Confidence threshold for candidate entry
+        self.locked_symbol = None          # Prevents runaway duplicates (AAAAAA)
+        self.dip_counter = 0               # Tracks confidence dip to unlock for next sign
+        self.idle_start_time = None        # Tracks hand absence for auto-spacing
+        self.auto_space_delay = 1.6        # 1.6s hands-down triggers space
+        self.auto_space_paused_until = 0.0
+        self.refractory_cooldown = 0.0     # Brief 200ms pause after emission
         
         # --- Snapshot Mode State ---
         self.snapshot_timer_start = None
         self.cooldown_until = 0.0
-        self.flash_frames = 0
-        
-        # --- Continuous Mode State Machine ---
-        # Highly responsive buffer: 8 frames (~200-250ms window)
-        self.pred_buffer = deque(maxlen=8)
-        self.min_consensus_count = 5      # 5 of 8 frames (~62%) to lock in quickly
-        self.min_confidence = 0.50         # Responsive confidence threshold
-        self.locked_symbol = None
-        self.continuous_cooldown_until = 0.0
-        self.idle_start_time = None
-        self.auto_space_delay = 1.6
-        self.auto_space_paused_until = 0.0
         
         self.setup_ui()
         self.update_frame()
@@ -108,9 +112,9 @@ class ISLApp:
         
         # Mode Toggle Button
         self.btn_mode = tk.Button(
-            header_frame, text="Mode: Snapshot (Click to Switch)", 
-            font=("Helvetica", 11, "bold"), bg="#673ab7", fg="white", 
-            activebackground="#512da8", activeforeground="white",
+            header_frame, text="Mode: Continuous Stream (Click to Switch)", 
+            font=("Helvetica", 11, "bold"), bg="#00897b", fg="white", 
+            activebackground="#00695c", activeforeground="white",
             relief=tk.RAISED, cursor="hand2", command=self.toggle_mode
         )
         self.btn_mode.pack(side=tk.RIGHT, ipadx=10, ipady=3)
@@ -122,12 +126,12 @@ class ISLApp:
         # Mode Explanation Banner
         self.lbl_mode_info = tk.Label(
             self.root, 
-            text="[Snapshot Mode] Hold your sign inside the box for 2 seconds to capture.",
-            font=("Helvetica", 10, "italic"), fg="#bbbbbb", bg="#1e1e1e"
+            text="[Continuous Stream] Real-time fluid signing. Signs commit automatically as confidence peaks.",
+            font=("Helvetica", 10, "italic"), fg="#80cbc4", bg="#1e1e1e"
         )
         self.lbl_mode_info.pack(pady=(0, 2))
         
-        # Section 1: Recognized Text
+        # Section 1: Recognized English Text
         text_label = tk.Label(
             self.root, text="Recognized English Text:", 
             font=("Helvetica", 10, "bold"), fg="#b0bec5", bg="#1e1e1e"
@@ -187,7 +191,6 @@ class ISLApp:
         )
         trans_frame.pack(fill=tk.X, padx=20, pady=6)
         
-        # Translation Controls Row
         ctrl_row = tk.Frame(trans_frame, bg="#1e1e1e")
         ctrl_row.pack(fill=tk.X, padx=10, pady=4)
         
@@ -228,7 +231,7 @@ class ISLApp:
         
         # Translation Status Label
         self.lbl_trans_status = tk.Label(
-            trans_frame, text="Ready — Click 'AI Translate & Fix' to correct typos and translate.", 
+            trans_frame, text="Ready — Sign continuously, then click 'AI Translate & Fix'.", 
             font=("Helvetica", 9, "italic"), fg="#aaaaaa", bg="#1e1e1e"
         )
         self.lbl_trans_status.pack(anchor=tk.W, padx=10, pady=(1, 2))
@@ -242,15 +245,16 @@ class ISLApp:
         self.trans_text_box.pack(fill=tk.X, padx=10, pady=(2, 6))
 
     def toggle_mode(self):
-        """Flushes states and toggles between Snapshot and Continuous mode."""
+        """Flushes states and toggles between Snapshot and Continuous Stream mode."""
         if self.mode == "snapshot":
             self.mode = "continuous"
             self.btn_mode.config(
-                text="Mode: Continuous (Click to Switch)", 
+                text="Mode: Continuous Stream (Click to Switch)", 
                 bg="#00897b", activebackground="#00695c"
             )
             self.lbl_mode_info.config(
-                text="[Continuous Mode] Sign continuously. Hands-free space triggers after 1.5s idle."
+                text="[Continuous Stream] Real-time fluid signing. Signs commit automatically as confidence peaks.",
+                fg="#80cbc4"
             )
         else:
             self.mode = "snapshot"
@@ -259,16 +263,18 @@ class ISLApp:
                 bg="#673ab7", activebackground="#512da8"
             )
             self.lbl_mode_info.config(
-                text="[Snapshot Mode] Hold your sign inside the box for 2 seconds to capture."
+                text="[Snapshot Mode] Hold your sign inside the box for 2 seconds to capture.",
+                fg="#bbbbbb"
             )
             
         self.snapshot_timer_start = None
         self.cooldown_until = 0.0
-        self.pred_buffer.clear()
+        self.stream_buffer.clear()
         self.locked_symbol = None
-        self.continuous_cooldown_until = 0.0
+        self.dip_counter = 0
+        self.refractory_cooldown = 0.0
         self.idle_start_time = None
-        self.flash_frames = 0
+        self.box_glow_frames = 0
 
     def add_space(self):
         current = self.text_box.get("1.0", "end-1c")
@@ -325,7 +331,8 @@ class ISLApp:
             print(f"Prediction error: {e}")
             return "None", 0.0
         
-    def trigger_char_emit(self, pred_char, is_continuous=False):
+    def trigger_char_emit(self, pred_char):
+        """Appends character and triggers clean box highlight (zero screen flash!)."""
         if pred_char.lower() == "space":
             self.add_space()
         elif pred_char.lower() in ["delete", "del", "backspace"]:
@@ -334,9 +341,9 @@ class ISLApp:
             self.text_box.insert(tk.END, pred_char)
             self.text_box.see(tk.END)
             
-        self.flash_frames = 2 if is_continuous else 4
-        if not is_continuous:
-            self.cooldown_until = time.time() + 1.5
+        # Subtle green box glow feedback instead of full-screen flash!
+        self.box_glow_frames = 4
+        self.last_emitted_char = pred_char
 
     def check_auto_space(self, current_time):
         if hasattr(self, "auto_space_paused_until") and current_time < self.auto_space_paused_until:
@@ -354,15 +361,23 @@ class ISLApp:
             if current_text and not current_text.endswith(" "):
                 self.text_box.insert(tk.END, " ")
                 self.text_box.see(tk.END)
-                self.flash_frames = 1
+                self.box_glow_frames = 2
+                self.last_emitted_char = "SPACE"
             self.idle_start_time = current_time
             return "Auto-Spaced"
         return f"Auto-Space in {remaining:.1f}s"
 
-    def handle_continuous_mode(self, frame, in_box, features, current_time, pred_char, conf):
+    def handle_continuous_stream(self, frame, in_box, features, current_time, pred_char, conf):
+        """
+        Peak-Confidence Stream Engine:
+        Continuously reads the gesture stream, detects the peak confidence point,
+        and commits the sign instantly without any countdown or screen flash.
+        """
         if not in_box or np.all(features == 0.0):
-            self.pred_buffer.clear()
+            # Hands not detected: clear stream and unlock symbol
+            self.stream_buffer.clear()
             self.locked_symbol = None
+            self.dip_counter = 0
             status_text = self.check_auto_space(current_time)
             msg = status_text if status_text else "Place hands in box"
             cv2.putText(frame, msg, (self.BOX_X1 + 10, self.BOX_Y1 + 32), 
@@ -371,57 +386,57 @@ class ISLApp:
 
         self.idle_start_time = None
         
-        if current_time < self.continuous_cooldown_until:
-            cv2.putText(frame, "Refractory Cooldown...", (self.BOX_X1 + 10, self.BOX_Y1 + 32), 
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.75, (0, 255, 255), 2)
+        # Brief 200ms refractory pause after emission to absorb hand twitch
+        if current_time < self.refractory_cooldown:
             return
-            
-        # Re-use pre-calculated prediction (zero redundant inference!)
-        if conf >= self.min_confidence and pred_char != "None":
-            self.pred_buffer.append(pred_char)
-        else:
-            self.pred_buffer.append(None)
 
+        # Unlock transition detection:
+        # If confidence dips below 0.40 or switches to a different sign, release the lock
         if self.locked_symbol is not None:
-            locked_occurrences = self.pred_buffer.count(self.locked_symbol)
-            if locked_occurrences < 2:
+            if conf < 0.42:
+                self.dip_counter += 1
+                if self.dip_counter >= 2:
+                    self.locked_symbol = None
+                    self.dip_counter = 0
+            elif pred_char != self.locked_symbol and conf >= 0.55:
+                # Strong transition to a different symbol
                 self.locked_symbol = None
-
-        valid_preds = [p for p in self.pred_buffer if p is not None]
-        
-        if len(valid_preds) >= 4:
-            candidate, count = Counter(valid_preds).most_common(1)[0]
-            
-            progress_ratio = min(1.0, count / float(self.min_consensus_count))
-            bar_w = int((self.BOX_X2 - self.BOX_X1 - 20) * progress_ratio)
-            cv2.rectangle(
-                frame, 
-                (self.BOX_X1 + 10, self.BOX_Y2 - 22), 
-                (self.BOX_X1 + 10 + bar_w, self.BOX_Y2 - 10), 
-                (0, 220, 0) if count >= self.min_consensus_count else (0, 180, 255), 
-                -1
-            )
-            
-            if candidate == self.locked_symbol:
-                cv2.putText(frame, f"Locked: {candidate} (Change sign to continue)", 
-                            (self.BOX_X1 + 10, self.BOX_Y1 + 32), 
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.75, (0, 255, 0), 2)
-            elif count >= self.min_consensus_count:
-                self.trigger_char_emit(candidate, is_continuous=True)
-                self.locked_symbol = candidate
-                self.pred_buffer.clear()
-                self.continuous_cooldown_until = current_time + 0.25
+                self.dip_counter = 0
             else:
-                cv2.putText(frame, f"Stabilizing: {candidate} ({count}/{self.min_consensus_count})", 
+                self.dip_counter = 0
+                cv2.putText(frame, f"Locked: {self.locked_symbol} (Move to next sign)", 
                             (self.BOX_X1 + 10, self.BOX_Y1 + 32), 
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.75, (0, 180, 255), 2)
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.75, (0, 255, 120), 2)
+                return
+
+        # Append candidate if confident
+        if conf >= self.min_stream_conf and pred_char != "None":
+            self.stream_buffer.append(pred_char)
         else:
-            cv2.putText(frame, "Analyzing Gesture...", (self.BOX_X1 + 10, self.BOX_Y1 + 32), 
+            self.stream_buffer.append(None)
+
+        # Evaluate peak consensus from the short rolling window
+        valid_items = [p for p in self.stream_buffer if p is not None]
+        if len(valid_items) >= self.min_commit_frames:
+            candidate, count = Counter(valid_items).most_common(1)[0]
+            
+            # If at least 4 of 6 frames agree on the gesture -> PEAK DETECTED!
+            if count >= self.min_commit_frames and candidate != self.locked_symbol:
+                self.trigger_char_emit(candidate)
+                self.locked_symbol = candidate
+                self.stream_buffer.clear()
+                self.refractory_cooldown = current_time + 0.20
+            else:
+                cv2.putText(frame, f"Reading: {candidate}...", (self.BOX_X1 + 10, self.BOX_Y1 + 32), 
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.75, (0, 220, 255), 2)
+        else:
+            cv2.putText(frame, "Tracking sign...", (self.BOX_X1 + 10, self.BOX_Y1 + 32), 
                         cv2.FONT_HERSHEY_SIMPLEX, 0.75, (160, 160, 160), 2)
 
     def handle_snapshot_mode(self, frame, in_box, features, current_time, pred_char, conf):
+        """Standard 2.0s countdown Snapshot Mode (clean border highlight, no white flash)."""
         if current_time < self.cooldown_until:
-            cv2.putText(frame, "Snapshot Captured! Resetting...", (self.BOX_X1 + 10, self.BOX_Y1 + 32), 
+            cv2.putText(frame, "Captured! Resetting...", (self.BOX_X1 + 10, self.BOX_Y1 + 32), 
                         cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 255), 2)
             self.snapshot_timer_start = None
         else:
@@ -442,7 +457,8 @@ class ISLApp:
                 )
                 
                 if remaining <= 0:
-                    self.trigger_char_emit(pred_char, is_continuous=False)
+                    self.trigger_char_emit(pred_char)
+                    self.cooldown_until = current_time + 1.2
                     self.snapshot_timer_start = None
                 else:
                     cv2.putText(frame, f"Capturing in {remaining:.1f}...", (self.BOX_X1 + 10, self.BOX_Y1 + 32), 
@@ -475,7 +491,6 @@ class ISLApp:
         translated = res.get("translated_text", "")
         engine = res.get("engine", "")
         
-        # Update English text box with AI-repaired version if available
         if corrected and engine == "gemini":
             self.text_box.delete("1.0", tk.END)
             self.text_box.insert(tk.END, corrected)
@@ -490,7 +505,7 @@ class ISLApp:
         elif engine == "fallback":
             self.lbl_trans_status.config(text="Translated via Google Translator fallback.", fg="#ffd54f")
         else:
-            self.lbl_trans_status.config(text="Translation error. Check connection.", fg="#ef5350")
+            self.lbl_trans_status.config(text="Translation error. Check internet connection.", fg="#ef5350")
             
     def speak_translation(self):
         text = self.trans_text_box.get("1.0", "end-1c").strip()
@@ -519,7 +534,7 @@ class ISLApp:
                     imgtk = ImageTk.PhotoImage(image=img)
                     self.vid_label.imgtk = imgtk
                     self.vid_label.configure(image=imgtk)
-                self.root.after(30, self.update_frame)
+                self.root.after(10, self.update_frame)
                 return
 
             self.consecutive_cam_fails = 0
@@ -544,30 +559,38 @@ class ISLApp:
                         in_box = False
                         break
                         
+            # Single-pass model inference
             pred_char, conf = "None", 0.0
-            display_text = "Prediction: None"
+            display_text = "Live: None"
             color = (120, 120, 120)
             if not np.all(features == 0.0):
                 pred_char, conf = self.get_prediction(features)
                 display_text = f"Live: {pred_char} ({conf*100:.1f}%)"
-                color = (0, 255, 0) if conf > 0.50 else (0, 165, 255)
+                color = (0, 255, 0) if conf > 0.55 else (0, 165, 255)
                 
             cv2.putText(frame, display_text, (20, 36), cv2.FONT_HERSHEY_SIMPLEX, 0.8, color, 2)
             
-            box_color = (0, 255, 0) if in_box else (100, 100, 100)
-            cv2.rectangle(frame, (self.BOX_X1, self.BOX_Y1), (self.BOX_X2, self.BOX_Y2), box_color, 2)
+            # Target Box Styling (Subtle highlight on commit instead of full screen flash!)
+            if self.box_glow_frames > 0:
+                box_color = (0, 255, 255) # Bright Cyan pulse
+                box_thickness = 4
+                cv2.putText(frame, f"+ {self.last_emitted_char}", (self.BOX_X2 - 80, self.BOX_Y1 + 32), 
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 255), 2)
+                self.box_glow_frames -= 1
+            else:
+                box_color = (0, 255, 0) if in_box else (100, 100, 100)
+                box_thickness = 2
+                
+            cv2.rectangle(frame, (self.BOX_X1, self.BOX_Y1), (self.BOX_X2, self.BOX_Y2), box_color, box_thickness)
             
             current_time = time.time()
             
             if self.mode == "snapshot":
                 self.handle_snapshot_mode(frame, in_box, features, current_time, pred_char, conf)
             else:
-                self.handle_continuous_mode(frame, in_box, features, current_time, pred_char, conf)
-                                
-            if self.flash_frames > 0:
-                frame[:] = 255
-                self.flash_frames -= 1
+                self.handle_continuous_stream(frame, in_box, features, current_time, pred_char, conf)
             
+            # Frame rendering to Tkinter
             cv_img = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
             img = Image.fromarray(cv_img)
             imgtk = ImageTk.PhotoImage(image=img)

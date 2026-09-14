@@ -1,6 +1,11 @@
 import threading
 import pyttsx3
 
+try:
+    import pythoncom
+except ImportError:
+    pythoncom = None
+
 class SpeechEngine:
     def __init__(self):
         self._lock = threading.Lock()
@@ -14,17 +19,28 @@ class SpeechEngine:
         def _worker():
             with self._lock:
                 self.is_speaking = True
+                com_initialized = False
+                if pythoncom is not None:
+                    try:
+                        pythoncom.CoInitialize()
+                        com_initialized = True
+                    except Exception:
+                        pass
                 try:
-                    # Initialize local engine instance per thread for stability on Windows SAPI5
                     engine = pyttsx3.init()
-                    engine.setProperty('rate', 160)     # Natural speaking pace
-                    engine.setProperty('volume', 1.0)   # Full volume
+                    engine.setProperty('rate', 160)
+                    engine.setProperty('volume', 1.0)
                     engine.say(text)
                     engine.runAndWait()
                     engine.stop()
                 except Exception as e:
                     print(f"[TTS] Speech error: {e}")
                 finally:
+                    if com_initialized and pythoncom is not None:
+                        try:
+                            pythoncom.CoUninitialize()
+                        except Exception:
+                            pass
                     self.is_speaking = False
 
         thread = threading.Thread(target=_worker, daemon=True)
