@@ -1,0 +1,11 @@
+mediapipe
+opencv-python
+numpy
+scikit-learn
+joblib
+pillow
+customtkinter
+tqdm
+kagglehub
+google-genai
+edge-tts
